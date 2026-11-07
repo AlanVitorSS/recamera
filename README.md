@@ -9,10 +9,10 @@ Projeto Android nativo (Kotlin + CameraX), preparado para compilar APK de teste 
 - Foco por toque: toque na imagem para focar e medir exposição naquele ponto; segure para travar foco/exposição (toque de novo para liberar).
 - Controle de compensação de exposição (clarear/escurecer).
 - Captura sequencial de 6 fotos (8 nos modos Lua e Noite).
-- Salva uma foto-base na pasta Pictures/Recamera.
+- Alinha as fotos da sequência (OpenCV/ECC), combina com média ponderada (ignora áreas com movimento) e aplica nitidez leve. Salva o resultado em Pictures/Recamera e o original em Pictures/Recamera/Originais.
 
 ## Limitação importante
-Esta é uma primeira base compilável, não a câmera final prometida. A sequência ainda NÃO é alinhada nem empilhada; o app salva uma foto-base e descarta as demais. Isso evita prometer ganho de qualidade falso. As próximas etapas são: seleção automática das melhores imagens, alinhamento/registro, empilhamento real (OpenCV), teste em S24 e S24 FE, e depois modelos TFLite/ONNX compatíveis.
+Esta é uma base de testes, não a câmera final. O empilhamento da v0.3 é um primeiro pipeline offline: o ganho depende de a cena estar estável e de o celular ficar firme; se o alinhamento falhar, o app salva o primeiro quadro sem processar e avisa. As próximas etapas são: seleção automática das melhores imagens, alinhamento/registro, empilhamento real (OpenCV), teste em S24 e S24 FE, e depois modelos TFLite/ONNX compatíveis.
 
 ## API de IA
 A tela de configurações/API ainda não está implementada nesta base. Não coloque uma chave Gemini diretamente no código ou no GitHub. Quando a integração for criada, a chave deverá ser guardada localmente com armazenamento seguro e o envio de fotos será opcional, com aviso explícito. Uma chave exposta no APK pode ser extraída; para uso comercial, prefira um backend próprio.
