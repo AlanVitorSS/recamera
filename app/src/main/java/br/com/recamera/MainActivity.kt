@@ -34,6 +34,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import java.io.File
 import java.io.IOException
+import java.io.OutputStream
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -65,6 +66,7 @@ class MainActivity : ComponentActivity() {
 
     private var mode = "AUTO"
     private var busy = false
+    private var opencvOk = false
     private var ringSize = 0
     private var focusToken = 0
     private var zoomMin = 1f
@@ -82,7 +84,9 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
         )
+        opencvOk = Stacker.init()
         buildScreen()
+        if (!opencvOk) toast("OpenCV não carregou: as fotos serão salvas sem empilhamento.", long = true)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
         else permission.launch(Manifest.permission.CAMERA)
     }
@@ -159,7 +163,7 @@ class MainActivity : ComponentActivity() {
         captureButton = Button(this).apply { textSize = 16f; setOnClickListener { captureBurst() } }
         root.addView(captureButton, LinearLayout.LayoutParams(-1, dp(64)))
         root.addView(TextView(this).apply {
-            text = "Toque na imagem para focar · segure para travar foco/exposição.\nProtótipo: o alinhamento e o empilhamento virão nas próximas etapas."
+            text = "Toque na imagem para focar · segure para travar foco/exposição.\nAs fotos da sequência são alinhadas e combinadas para reduzir ruído e ganhar nitidez."
             textSize = 11f; setTextColor(0xFFCCCCCC.toInt()); gravity = Gravity.CENTER; setPadding(dp(8), dp(4), dp(8), dp(8))
         })
         setContentView(root)
@@ -330,30 +334,52 @@ class MainActivity : ComponentActivity() {
         })
     }
 
-    // MVP conservador: salva a primeira imagem capturada. Não afirma empilhamento ainda.
     private fun finishBurst() {
         val files = tempFiles.toList()
         tempFiles.clear()
-        val first = files.firstOrNull()
-        if (first == null) { toast("Nenhuma foto capturada."); setBusy(false); return }
-        captureButton.text = "Salvando…"
-        executor.execute { // cópia de arquivo fora da thread principal
-            val msg = try {
-                savePhoto(first)
-                "Sequência concluída. Foto-base salva em Fotos/Recamera."
-            } catch (e: Exception) {
-                "Erro ao salvar: ${e.message}"
-            }
+        if (files.isEmpty()) { toast("Nenhuma foto capturada."); setBusy(false); return }
+        captureButton.text = "Processando…"
+        executor.execute { // processamento pesado fora da thread principal
+            val msg = try { processAndSave(files) } catch (e: Throwable) { "Erro ao salvar: ${e.message}" }
             files.forEach { it.delete() }
             runOnUiThread { toast(msg, long = true); setBusy(false) }
         }
     }
 
-    private fun savePhoto(source: File) {
+    private fun processAndSave(files: List<File>): String {
+        val stamp = System.currentTimeMillis()
+        val original = files.first()
+
+        var result: StackResult? = null
+        var failure: String? = null
+        if (!opencvOk) failure = "OpenCV indisponível"
+        else if (files.size < 2) failure = "poucas fotos"
+        else try {
+            result = Stacker.process(files) { done, total ->
+                runOnUiThread { captureButton.text = "Alinhando $done/$total…" }
+            }
+            if (result == null) failure = "não foi possível alinhar os quadros"
+        } catch (e: Throwable) { // inclui falta de memória
+            failure = e.javaClass.simpleName
+        }
+
+        val res = result
+        saveToGallery("Recamera_$stamp.jpg", "Pictures/Recamera") { out ->
+            if (res != null) out.write(res.jpeg) else original.inputStream().use { it.copyTo(out) }
+        }
+        if (res == null) return "Salva sem empilhar ($failure)."
+        // Mantém o original (com os metadados da câmera) separado
+        saveToGallery("Recamera_${stamp}_original.jpg", "Pictures/Recamera/Originais") { out ->
+            original.inputStream().use { it.copyTo(out) }
+        }
+        return "Foto combinada com ${res.used} de ${res.total} quadros. Original em Fotos/Recamera/Originais."
+    }
+
+    private fun saveToGallery(name: String, relativePath: String, write: (OutputStream) -> Unit) {
         val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, "Recamera_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Recamera")
+            put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
         val resolver = contentResolver
@@ -361,7 +387,7 @@ class MainActivity : ComponentActivity() {
             ?: throw IOException("não foi possível criar o arquivo na galeria")
         try {
             val out = resolver.openOutputStream(uri) ?: throw IOException("não foi possível abrir o arquivo")
-            out.use { o -> source.inputStream().use { it.copyTo(o) } }
+            out.use { write(it) }
             values.clear()
             values.put(MediaStore.Images.Media.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
