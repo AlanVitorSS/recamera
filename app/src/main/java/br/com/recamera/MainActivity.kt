@@ -7,14 +7,18 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.MediaStore
+import android.text.InputType
 import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -32,6 +36,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.io.File
 import java.io.IOException
 import java.io.OutputStream
@@ -67,6 +72,7 @@ class MainActivity : ComponentActivity() {
     private var mode = "AUTO"
     private var busy = false
     private var opencvOk = false
+    private lateinit var ai: AiSettings
     private var ringSize = 0
     private var focusToken = 0
     private var zoomMin = 1f
@@ -84,6 +90,7 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
         )
+        ai = AiSettings(this)
         opencvOk = Stacker.init()
         buildScreen()
         if (!opencvOk) toast("OpenCV não carregou: as fotos serão salvas sem empilhamento.", long = true)
@@ -118,6 +125,14 @@ class MainActivity : ComponentActivity() {
         val frame = FrameLayout(this)
         frame.addView(previewView, FrameLayout.LayoutParams(-1, -1))
         frame.addView(focusRing, FrameLayout.LayoutParams(ringSize, ringSize))
+        val gear = Button(this).apply {
+            text = "⚙"; textSize = 20f; minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
+            setPadding(0, 0, 0, 0)
+            setOnClickListener { showSettings() }
+        }
+        frame.addView(gear, FrameLayout.LayoutParams(dp(48), dp(48)).apply {
+            gravity = Gravity.TOP or Gravity.END; setMargins(0, dp(8), dp(8), 0)
+        })
         root.addView(frame, LinearLayout.LayoutParams(-1, 0, 1f))
         setupFocusGesture()
 
@@ -163,7 +178,7 @@ class MainActivity : ComponentActivity() {
         captureButton = Button(this).apply { textSize = 16f; setOnClickListener { captureBurst() } }
         root.addView(captureButton, LinearLayout.LayoutParams(-1, dp(64)))
         root.addView(TextView(this).apply {
-            text = "Toque na imagem para focar · segure para travar foco/exposição.\nAs fotos da sequência são alinhadas e combinadas para reduzir ruído e ganhar nitidez."
+            text = "Toque na imagem para focar · segure para travar foco/exposição.\nAs fotos da sequência são alinhadas e combinadas. ⚙ = IA Gemini (opcional)."
             textSize = 11f; setTextColor(0xFFCCCCCC.toInt()); gravity = Gravity.CENTER; setPadding(dp(8), dp(4), dp(8), dp(8))
         })
         setContentView(root)
@@ -372,7 +387,20 @@ class MainActivity : ComponentActivity() {
         saveToGallery("Recamera_${stamp}_original.jpg", "Pictures/Recamera/Originais") { out ->
             original.inputStream().use { it.copyTo(out) }
         }
-        return "Foto combinada com ${res.used} de ${res.total} quadros. Original em Fotos/Recamera/Originais."
+        var aiNote = ""
+        if (ai.enabled) {
+            val key = ai.loadKey()
+            if (key == null) aiNote = " IA: chave não encontrada, abra ⚙ e informe de novo."
+            else try {
+                runOnUiThread { captureButton.text = "Enviando à IA…" }
+                val enhanced = GeminiClient.enhance(key, ai.model, res.jpeg)
+                saveToGallery("Recamera_${stamp}_IA.jpg", "Pictures/Recamera/IA") { it.write(enhanced) }
+                aiNote = " Versão IA em Fotos/Recamera/IA."
+            } catch (e: Throwable) {
+                aiNote = " IA não aplicada: ${e.message}."
+            }
+        }
+        return "Foto combinada com ${res.used} de ${res.total} quadros. Original em Fotos/Recamera/Originais.$aiNote"
     }
 
     private fun saveToGallery(name: String, relativePath: String, write: (OutputStream) -> Unit) {
@@ -394,6 +422,92 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             resolver.delete(uri, null, null) // não deixa foto vazia/pendente na galeria
             throw e
+        }
+    }
+
+    // ---------- Configurações da IA (Gemini) ----------
+
+    private fun showSettings() {
+        val pad = dp(20)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, dp(8), pad, 0) }
+        col.addView(TextView(this).apply {
+            text = "Chave da API Gemini"; setPadding(0, dp(8), 0, 0)
+        })
+        val keyField = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            isSingleLine = true
+            hint = if (ai.hasKey()) "Chave salva (digite para trocar)" else "Cole aqui a sua chave"
+        }
+        col.addView(keyField)
+        col.addView(TextView(this).apply { text = "Modelo de imagem"; setPadding(0, dp(12), 0, 0) })
+        val modelField = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            isSingleLine = true
+            setText(ai.model)
+        }
+        col.addView(modelField)
+        val sw = Switch(this).apply {
+            text = "Melhorar também com IA (online)"; isChecked = ai.enabled; setPadding(0, dp(12), 0, dp(4))
+        }
+        col.addView(sw)
+        col.addView(TextView(this).apply {
+            textSize = 12f
+            text = "Desligado por padrão: sem IA o app funciona 100% offline.\n\n" +
+                "Com a IA ligada, depois de combinar as fotos o app envia a foto combinada (reduzida a no máximo " +
+                "2048 px) ao Google Gemini pela internet, usando a sua chave, e salva o resultado separado em " +
+                "Fotos/Recamera/IA. A foto combinada e o original continuam sempre guardados.\n\n" +
+                "Atenção: a IA pode alterar detalhes (inclusive rostos e textos), e a imagem dela costuma ter " +
+                "resolução menor que a foto combinada. Por isso ela não substitui a sua foto.\n\n" +
+                "A chave fica cifrada só neste aparelho e nunca vai para o código ou o GitHub."
+        })
+        col.addView(Button(this).apply {
+            text = "Testar chave (não envia fotos)"
+            setOnClickListener {
+                val typed = keyField.text.toString().filter { !it.isWhitespace() }
+                val key = typed.ifEmpty { ai.loadKey().orEmpty() }
+                val model = modelField.text.toString().trim().ifEmpty { GeminiClient.DEFAULT_MODEL }
+                if (key.isEmpty()) { toast("Informe a chave primeiro."); return@setOnClickListener }
+                toast("Testando…")
+                Thread {
+                    val msg = try { GeminiClient.test(key, model) } catch (e: Exception) { "Falhou: ${e.message}" }
+                    runOnUiThread { toast(msg, long = true) }
+                }.start()
+            }
+        })
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Configurações de IA")
+            .setView(ScrollView(this).apply { addView(col) })
+            .setPositiveButton("Salvar") { _, _ ->
+                saveSettings(keyField.text.toString().filter { !it.isWhitespace() }, modelField.text.toString().trim(), sw.isChecked)
+            }
+            .setNegativeButton("Cancelar", null)
+            .setNeutralButton("Apagar chave") { _, _ ->
+                ai.clearKey(); ai.enabled = false; toast("Chave apagada. IA desligada.")
+            }
+            .show()
+    }
+
+    private fun saveSettings(key: String, model: String, enable: Boolean) {
+        if (key.isNotEmpty()) {
+            if (!Regex("^[A-Za-z0-9_.-]{20,}$").matches(key)) { toast("A chave parece inválida. Confira e cole de novo.", long = true); return }
+            ai.saveKey(key)
+        }
+        ai.model = model.ifEmpty { GeminiClient.DEFAULT_MODEL }
+        if (enable && !ai.hasKey()) { ai.enabled = false; toast("Informe a chave para ligar a IA.", long = true); return }
+        if (enable && !ai.consent) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Enviar fotos à internet?")
+                .setMessage(
+                    "Com a IA ligada, as fotos combinadas serão enviadas ao Google Gemini, pela internet, usando a sua " +
+                    "chave e o seu limite de uso. Não use em fotos que você não quer enviar. " +
+                    "Você pode desligar quando quiser em ⚙."
+                )
+                .setPositiveButton("Concordo") { _, _ -> ai.consent = true; ai.enabled = true; toast("IA ligada.") }
+                .setNegativeButton("Cancelar") { _, _ -> ai.enabled = false; toast("IA continua desligada.") }
+                .show()
+        } else {
+            ai.enabled = enable
+            toast(if (enable) "IA ligada." else "Configurações salvas.")
         }
     }
 
