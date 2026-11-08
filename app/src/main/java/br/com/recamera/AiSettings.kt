@@ -27,8 +27,16 @@ class AiSettings(context: Context) {
         set(v) { prefs.edit().putBoolean("consent", v).apply() }
 
     var model: String
-        get() = prefs.getString("model", null)?.takeIf { it.isNotBlank() } ?: GeminiClient.DEFAULT_MODEL
+        get() {
+            val m = prefs.getString("model", null)?.takeIf { it.isNotBlank() }
+            return if (m == null || m in RETIRED_MODELS) GeminiClient.DEFAULT_MODEL else m
+        }
         set(v) { prefs.edit().putString("model", v).apply() }
+
+    /** Tamanho pedido à IA: 1K, 2K ou 4K (maior lado aproximado). */
+    var imageSize: String
+        get() = prefs.getString("size", null)?.takeIf { it in listOf("1K", "2K", "4K") } ?: "2K"
+        set(v) { prefs.edit().putString("size", v).apply() }
 
     fun hasKey(): Boolean = prefs.contains("key")
 
@@ -68,5 +76,9 @@ class AiSettings(context: Context) {
         return gen.generateKey()
     }
 
-    private companion object { const val ALIAS = "recamera_ai_key" }
+    private companion object {
+        const val ALIAS = "recamera_ai_key"
+        // Modelos que o Google anunciou como desativados: troca automaticamente pelo padrão
+        val RETIRED_MODELS = setOf("gemini-2.5-flash-image")
+    }
 }

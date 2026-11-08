@@ -9,8 +9,8 @@ android {
         applicationId = "br.com.recamera"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.4.0"
+        versionCode = 4
+        versionName = "0.5.0"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions {

@@ -16,6 +16,8 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
@@ -393,7 +395,7 @@ class MainActivity : ComponentActivity() {
             if (key == null) aiNote = " IA: chave não encontrada, abra ⚙ e informe de novo."
             else try {
                 runOnUiThread { captureButton.text = "Enviando à IA…" }
-                val enhanced = GeminiClient.enhance(key, ai.model, res.jpeg)
+                val enhanced = GeminiClient.enhance(key, ai.model, res.jpeg, ai.imageSize)
                 saveToGallery("Recamera_${stamp}_IA.jpg", "Pictures/Recamera/IA") { it.write(enhanced) }
                 aiNote = " Versão IA em Fotos/Recamera/IA."
             } catch (e: Throwable) {
@@ -446,6 +448,21 @@ class MainActivity : ComponentActivity() {
             setText(ai.model)
         }
         col.addView(modelField)
+        col.addView(TextView(this).apply {
+            textSize = 11f
+            text = "Padrão: ${GeminiClient.DEFAULT_MODEL} (consegue gerar até 4K). Modelos \"flash\" costumam devolver só 1K."
+        })
+        col.addView(TextView(this).apply { text = "Tamanho da imagem da IA"; setPadding(0, dp(12), 0, 0) })
+        val sizeOpts = listOf(
+            "1K" to "1K: rápido e mais barato",
+            "2K" to "2K: equilíbrio",
+            "4K" to "4K: mais pixels, mais lento e mais caro"
+        )
+        val sizeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        sizeOpts.forEachIndexed { i, (v, label) ->
+            sizeGroup.addView(RadioButton(this).apply { id = 1000 + i; text = label; isChecked = ai.imageSize == v })
+        }
+        col.addView(sizeGroup)
         val sw = Switch(this).apply {
             text = "Melhorar também com IA (online)"; isChecked = ai.enabled; setPadding(0, dp(12), 0, dp(4))
         }
@@ -454,10 +471,10 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             text = "Desligado por padrão: sem IA o app funciona 100% offline.\n\n" +
                 "Com a IA ligada, depois de combinar as fotos o app envia a foto combinada (reduzida a no máximo " +
-                "2048 px) ao Google Gemini pela internet, usando a sua chave, e salva o resultado separado em " +
+                "3072 px) ao Google Gemini pela internet, usando a sua chave, e salva o resultado separado em " +
                 "Fotos/Recamera/IA. A foto combinada e o original continuam sempre guardados.\n\n" +
                 "Atenção: a IA pode alterar detalhes (inclusive rostos e textos), e a imagem dela costuma ter " +
-                "resolução menor que a foto combinada. Por isso ela não substitui a sua foto.\n\n" +
+                "resolução diferente da foto combinada. Os pixels extras são detalhes que a IA estima, não detalhes reais da cena. Por isso ela não substitui a sua foto.\n\n" +
                 "A chave fica cifrada só neste aparelho e nunca vai para o código ou o GitHub."
         })
         col.addView(Button(this).apply {
@@ -478,7 +495,10 @@ class MainActivity : ComponentActivity() {
             .setTitle("Configurações de IA")
             .setView(ScrollView(this).apply { addView(col) })
             .setPositiveButton("Salvar") { _, _ ->
-                saveSettings(keyField.text.toString().filter { !it.isWhitespace() }, modelField.text.toString().trim(), sw.isChecked)
+                saveSettings(
+                    keyField.text.toString().filter { !it.isWhitespace() }, modelField.text.toString().trim(),
+                    sizeOpts.getOrNull(sizeGroup.checkedRadioButtonId - 1000)?.first ?: "2K", sw.isChecked
+                )
             }
             .setNegativeButton("Cancelar", null)
             .setNeutralButton("Apagar chave") { _, _ ->
@@ -487,12 +507,13 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    private fun saveSettings(key: String, model: String, enable: Boolean) {
+    private fun saveSettings(key: String, model: String, size: String, enable: Boolean) {
         if (key.isNotEmpty()) {
             if (!Regex("^[A-Za-z0-9_.-]{20,}$").matches(key)) { toast("A chave parece inválida. Confira e cole de novo.", long = true); return }
             ai.saveKey(key)
         }
         ai.model = model.ifEmpty { GeminiClient.DEFAULT_MODEL }
+        ai.imageSize = size
         if (enable && !ai.hasKey()) { ai.enabled = false; toast("Informe a chave para ligar a IA.", long = true); return }
         if (enable && !ai.consent) {
             MaterialAlertDialogBuilder(this)

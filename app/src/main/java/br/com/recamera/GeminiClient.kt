@@ -15,14 +15,25 @@ import kotlin.math.roundToInt
 
 /** Cliente mínimo da API Gemini (REST). A chave vai no cabeçalho, nunca na URL nem em log. */
 object GeminiClient {
-    const val DEFAULT_MODEL = "gemini-2.5-flash-image"
+    const val DEFAULT_MODEL = "gemini-3-pro-image-preview"
     private const val BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
-    private const val MAX_SIDE = 2048
+    private const val MAX_SIDE = 3072
     private const val PROMPT =
-        "Enhance this photograph: reduce noise and grain, improve sharpness and fine detail, " +
-        "and correct exposure and color naturally. Keep the composition, framing, objects, people, " +
-        "faces and any text exactly the same. Do not add, remove or invent anything. " +
-        "Return only the enhanced image."
+        "Upscale and enhance this photograph to a higher resolution: reduce noise and grain, " +
+        "recover sharpness and fine detail, and correct exposure and color naturally. " +
+        "Keep the composition, framing, objects, people, faces and any text exactly the same. " +
+        "Do not add, remove or invent anything. Return only the enhanced image."
+
+    // Proporções aceitas pela API de imagem
+    private val RATIOS = listOf(
+        "1:1" to 1.0, "2:3" to 2.0 / 3, "3:2" to 1.5, "3:4" to 0.75, "4:3" to 4.0 / 3,
+        "4:5" to 0.8, "5:4" to 1.25, "9:16" to 9.0 / 16, "16:9" to 16.0 / 9, "21:9" to 21.0 / 9
+    )
+
+    private fun nearestRatio(w: Int, h: Int): String {
+        val r = Math.log(w.toDouble() / h)
+        return RATIOS.minByOrNull { Math.abs(Math.log(it.second) - r) }!!.first
+    }
 
     private fun checkModel(model: String): String {
         if (!Regex("^[A-Za-z0-9._-]{3,80}$").matches(model)) throw IOException("nome de modelo inválido")
@@ -35,18 +46,36 @@ object GeminiClient {
         return "Chave válida. Modelo encontrado."
     }
 
-    /** Envia a foto (reduzida a no máx. 2048 px) e devolve a versão melhorada em JPEG. */
-    fun enhance(apiKey: String, model: String, jpeg: ByteArray): ByteArray {
-        val small = shrinkToJpeg(jpeg)
-        val b64 = Base64.encodeToString(small, Base64.NO_WRAP)
-        val body = JSONObject()
+    private class Shrunk(val jpeg: ByteArray, val w: Int, val h: Int)
+
+    private fun buildBody(b64: String, aspect: String, size: String?): ByteArray {
+        val cfg = JSONObject().put("aspectRatio", aspect)
+        if (size != null) cfg.put("imageSize", size)
+        return JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray()
                 .put(JSONObject().put("text", PROMPT))
                 .put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", b64))))))
-            .put("generationConfig", JSONObject().put("responseModalities", JSONArray().put("TEXT").put("IMAGE")))
+            .put("generationConfig", JSONObject()
+                .put("responseModalities", JSONArray().put("TEXT").put("IMAGE"))
+                .put("imageConfig", cfg))
             .toString().toByteArray(Charsets.UTF_8)
+    }
 
-        val resp = JSONObject(request(BASE + checkModel(model) + ":generateContent", apiKey, body, 120_000))
+    /** Envia a foto (reduzida a no máx. 3072 px) e devolve a versão melhorada em JPEG. */
+    fun enhance(apiKey: String, model: String, jpeg: ByteArray, imageSize: String): ByteArray {
+        val small = shrinkToJpeg(jpeg)
+        val b64 = Base64.encodeToString(small.jpeg, Base64.NO_WRAP)
+        val aspect = nearestRatio(small.w, small.h)
+        val url = BASE + checkModel(model) + ":generateContent"
+
+        val text = try {
+            request(url, apiKey, buildBody(b64, aspect, imageSize), 240_000)
+        } catch (e: IOException) {
+            // Alguns modelos não aceitam "imageSize": tenta de novo só com a proporção
+            if (e.message?.startsWith("erro 400") == true) request(url, apiKey, buildBody(b64, aspect, null), 240_000)
+            else throw e
+        }
+        val resp = JSONObject(text)
         val parts = resp.optJSONArray("candidates")?.optJSONObject(0)
             ?.optJSONObject("content")?.optJSONArray("parts")
         if (parts != null) {
@@ -61,7 +90,7 @@ object GeminiClient {
         throw IOException(if (block.isNotEmpty()) "a IA bloqueou a imagem ($block)" else "a IA não devolveu imagem")
     }
 
-    private fun shrinkToJpeg(src: ByteArray): ByteArray {
+    private fun shrinkToJpeg(src: ByteArray): Shrunk {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(src, 0, src.size, bounds)
         var sample = 1
@@ -76,8 +105,9 @@ object GeminiClient {
         if (scaled !== bmp) bmp.recycle()
         val out = ByteArrayOutputStream()
         scaled.compress(Bitmap.CompressFormat.JPEG, 90, out)
+        val w = scaled.width; val h = scaled.height
         scaled.recycle()
-        return out.toByteArray()
+        return Shrunk(out.toByteArray(), w, h)
     }
 
     private fun toJpeg(img: ByteArray): ByteArray {
