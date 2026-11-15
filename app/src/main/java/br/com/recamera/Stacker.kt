@@ -65,8 +65,7 @@ object Stacker {
     }
 
     /** Matriz 2x3 (em escala do quadro pequeno) que alinha [img] à [ref], ou null se falhar. */
-    private fun alignWarp(ref: Mat, img: Mat): Mat? {
-        val levels = 3
+    internal fun alignWarp(ref: Mat, img: Mat, levels: Int = 3): Mat? {
         val refP = ArrayList<Mat>(); val imgP = ArrayList<Mat>()
         refP.add(ref); imgP.add(img)
         for (i in 1 until levels) {

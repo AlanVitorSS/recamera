@@ -38,6 +38,16 @@ class AiSettings(context: Context) {
         get() = prefs.getString("size", null)?.takeIf { it in listOf("1K", "2K", "4K") } ?: "2K"
         set(v) { prefs.edit().putString("size", v).apply() }
 
+    /** Usa o processamento do Samsung (HDR/Noite/Auto via CameraX Extensions) quando disponível. */
+    var nativeProcessing: Boolean
+        get() = prefs.getBoolean("native", true)
+        set(v) { prefs.edit().putBoolean("native", v).apply() }
+
+    /** Quantidade de quadros do modo Lua. */
+    var moonFrames: Int
+        get() = prefs.getInt("moon_frames", 40).takeIf { it in listOf(20, 40, 60, 100, 200, 300) } ?: 40
+        set(v) { prefs.edit().putInt("moon_frames", v).apply() }
+
     fun hasKey(): Boolean = prefs.contains("key")
 
     fun saveKey(key: String) {

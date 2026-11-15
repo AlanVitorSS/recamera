@@ -9,8 +9,8 @@ android {
         applicationId = "br.com.recamera"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.5.0"
+        versionCode = 7
+        versionName = "0.8.0"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions {
@@ -29,5 +29,7 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    implementation("androidx.camera:camera-extensions:$camerax")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("org.opencv:opencv:4.9.0")
 }

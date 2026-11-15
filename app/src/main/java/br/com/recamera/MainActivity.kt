@@ -33,6 +33,8 @@ import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -74,6 +76,14 @@ class MainActivity : ComponentActivity() {
     private var mode = "AUTO"
     private var busy = false
     private var opencvOk = false
+    private var provider: ProcessCameraProvider? = null
+    private var extMgr: ExtensionsManager? = null
+    private var extActive = false   // câmera ligada com o processamento do Samsung (foto única)
+    private var burstNative = false // a sequência em andamento é de foto única do Samsung
+    private var burstMoon = false   // a sequência em andamento é do modo Lua
+    private var capturing = false    // fase de captura (permite parar)
+    private var stopRequested = false
+    private var moonSession: MoonSession? = null
     private lateinit var ai: AiSettings
     private var ringSize = 0
     private var focusToken = 0
@@ -144,7 +154,12 @@ class MainActivity : ComponentActivity() {
             val b = Button(this).apply {
                 text = label; textSize = 10f; minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
                 setPadding(0, 0, 0, 0)
-                setOnClickListener { mode = label; updateModeUi(); toast("Modo $label selecionado") }
+                setOnClickListener {
+                    if (busy) return@setOnClickListener
+                    mode = label
+                    bindCamera()
+                    toast("Modo $label: " + if (extActive) "processamento do Samsung" else "empilhamento do Recâmera")
+                }
             }
             modeButtons[label] = b
             modeRow.addView(b, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(2), 0, dp(2), 0) })
@@ -177,24 +192,38 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(expBar)
 
-        captureButton = Button(this).apply { textSize = 16f; setOnClickListener { captureBurst() } }
+        captureButton = Button(this).apply {
+            textSize = 16f
+            setOnClickListener {
+                if (capturing) { stopRequested = true; isEnabled = false; text = "Parando…" } else captureBurst()
+            }
+        }
         root.addView(captureButton, LinearLayout.LayoutParams(-1, dp(64)))
         root.addView(TextView(this).apply {
-            text = "Toque na imagem para focar · segure para travar foco/exposição.\nAs fotos da sequência são alinhadas e combinadas. ⚙ = IA Gemini (opcional)."
+            text = "Toque na imagem para focar · segure para travar foco/exposição.\nSamsung = foto única processada pelo celular; senão, as fotos são alinhadas e combinadas. ⚙ = opções e IA."
             textSize = 11f; setTextColor(0xFFCCCCCC.toInt()); gravity = Gravity.CENTER; setPadding(dp(8), dp(4), dp(8), dp(8))
         })
         setContentView(root)
         updateModeUi()
     }
 
-    private fun burstCount() = if (mode == "LUA" || mode == "NOITE") 8 else 6
+    private fun burstCount() = when {
+        mode == "LUA" && opencvOk -> ai.moonFrames
+        extActive -> 1
+        mode == "NOITE" -> 8
+        else -> 6
+    }
 
     private fun updateModeUi() {
         modeButtons.forEach { (label, b) ->
             b.alpha = if (label == mode) 1f else 0.45f
             b.setTypeface(null, if (label == mode) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
         }
-        if (!busy) captureButton.text = "●  FOTOGRAFAR (${burstCount()} FOTOS)"
+        if (!busy) captureButton.text = when {
+            mode == "LUA" && opencvOk -> "●  FOTOGRAFAR LUA (${burstCount()} QUADROS" + (if (extActive) " · HDR)" else ")")
+            extActive -> "●  FOTOGRAFAR (SAMSUNG)"
+            else -> "●  FOTOGRAFAR (${burstCount()} FOTOS)"
+        }
     }
 
     // ---------- Foco por toque ----------
@@ -266,17 +295,70 @@ class MainActivity : ComponentActivity() {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
-                val provider = future.get()
-                val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-                imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
-                provider.unbindAll()
-                val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
-                camera = cam
-                setupControls(cam)
+                val prov = future.get()
+                provider = prov
+                val extFuture = ExtensionsManager.getInstanceAsync(this, prov)
+                extFuture.addListener({
+                    extMgr = try { extFuture.get() } catch (e: Exception) { null }
+                    bindCamera()
+                }, ContextCompat.getMainExecutor(this))
             } catch (e: Exception) {
                 toast("Não foi possível iniciar a câmera: ${e.message}", long = true)
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /** Extensão do Samsung equivalente ao modo escolhido. */
+    private fun extensionFor(m: String) = when (m) {
+        "LUA" -> ExtensionMode.HDR
+        "NOITE" -> ExtensionMode.NIGHT
+        "RETRATO" -> ExtensionMode.BOKEH
+        "PAISAGEM" -> ExtensionMode.HDR
+        else -> ExtensionMode.AUTO
+    }
+
+    /** (Re)liga a câmera: com a extensão do Samsung se ligada e disponível, senão no modo comum. */
+    private fun bindCamera() {
+        val prov = provider ?: return
+        try {
+            var selector = CameraSelector.DEFAULT_BACK_CAMERA
+            extActive = false
+            val em = extMgr
+            if (ai.nativeProcessing && em != null) {
+                val ext = extensionFor(mode)
+                if (em.isExtensionAvailable(selector, ext)) {
+                    selector = em.getExtensionEnabledCameraSelector(selector, ext)
+                    extActive = true
+                }
+            }
+            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            val builder = ImageCapture.Builder()
+            if (!extActive) builder.setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            imageCapture = builder.build()
+            prov.unbindAll()
+            val cam = prov.bindToLifecycle(this, selector, preview, imageCapture)
+            camera = cam
+            setupControls(cam)
+            if (mode == "LUA") applyMoonPreset(cam)
+            updateModeUi()
+        } catch (e: Exception) {
+            toast("Não foi possível iniciar a câmera: ${e.message}", long = true)
+        }
+    }
+
+    /** Lua: zoom alto e exposição mais escura (a Lua é muito clara e o céu engana o medidor). */
+    private fun applyMoonPreset(cam: Camera) {
+        val target = minOf(10f, zoomMax)
+        cam.cameraControl.setZoomRatio(target)
+        zoomBar.progress = ratioToProgress(target)
+        val es = cam.cameraInfo.exposureState
+        if (es.isExposureCompensationSupported) {
+            val range = es.exposureCompensationRange
+            val idx = (-2f / expStep).roundToInt().coerceIn(range.lower, range.upper)
+            cam.cameraControl.setExposureCompensationIndex(idx)
+            expBar.progress = (idx - range.lower).coerceIn(0, expBar.max)
+            updateExposureLabel(idx)
+        }
     }
 
     /** Ajusta os sliders ao que a câmera realmente oferece (zoom mín/máx e faixa de exposição). */
@@ -328,20 +410,27 @@ class MainActivity : ComponentActivity() {
         val cap = imageCapture ?: return
         if (busy) return
         setBusy(true)
+        burstMoon = mode == "LUA" && opencvOk
+        if (burstMoon) { moonSession?.release(); moonSession = MoonSession() }
+        burstNative = extActive && !burstMoon
+        capturing = true
+        stopRequested = false
         tempFiles.clear()
         val count = burstCount()
-        toast("Capturando $count fotos… mantenha o celular firme.")
+        toast(if (count == 1) "Capturando…" else if (burstMoon) "Capturando $count quadros da Lua… use tripé ou apoie o celular. Toque no botão para parar antes." else "Capturando $count fotos… mantenha o celular firme.")
         captureNext(cap, count, 0)
     }
 
     private fun captureNext(cap: ImageCapture, total: Int, index: Int) {
-        if (index >= total) { finishBurst(); return }
-        captureButton.text = "Capturando ${index + 1}/$total…"
+        if (index >= total || stopRequested) { finishBurst(); return }
+        captureButton.text = if (burstMoon) "Lua ${index + 1}/$total · toque para parar" else "Capturando ${index + 1}/$total…"
         val file = File(cacheDir, "burst_${System.currentTimeMillis()}_$index.jpg")
         val options = ImageCapture.OutputFileOptions.Builder(file).build()
         cap.takePicture(options, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(result: ImageCapture.OutputFileResults) {
-                tempFiles.add(file)
+                val session = moonSession
+                if (burstMoon && session != null) executor.execute { session.add(file) } // processa já, em paralelo
+                else tempFiles.add(file)
                 captureNext(cap, total, index + 1)
             }
             override fun onError(exception: ImageCaptureException) {
@@ -352,20 +441,72 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun finishBurst() {
+        if (burstMoon) {
+            capturing = false
+            captureButton.isEnabled = false
+            captureButton.text = "Processando a Lua…"
+            val session = moonSession
+            executor.execute { // roda depois dos quadros pendentes, na mesma fila
+                val msg = try { processMoon(session) } catch (e: Throwable) { "Erro ao processar a Lua: ${e.message}" }
+                session?.release()
+                runOnUiThread { toast(msg, long = true); setBusy(false) }
+            }
+            return
+        }
         val files = tempFiles.toList()
         tempFiles.clear()
         if (files.isEmpty()) { toast("Nenhuma foto capturada."); setBusy(false); return }
+        capturing = false
+        captureButton.isEnabled = false
         captureButton.text = "Processando…"
         executor.execute { // processamento pesado fora da thread principal
-            val msg = try { processAndSave(files) } catch (e: Throwable) { "Erro ao salvar: ${e.message}" }
+            val msg = try { processAndSave(files, burstNative) } catch (e: Throwable) { "Erro ao salvar: ${e.message}" }
             files.forEach { it.delete() }
             runOnUiThread { toast(msg, long = true); setBusy(false) }
         }
     }
 
-    private fun processAndSave(files: List<File>): String {
+    private fun processMoon(session: MoonSession?): String {
+        val stamp = System.currentTimeMillis()
+        val s = session ?: return "Nenhum quadro da Lua."
+        var result: MoonResult? = null
+        var why = "não achei a Lua com nitidez suficiente em pelo menos 3 quadros"
+        try {
+            result = s.finish { stage, done, total ->
+                runOnUiThread { captureButton.text = "$stage $done/$total…" }
+            }
+        } catch (e: Throwable) {
+            why = e.javaClass.simpleName
+        }
+        val mr = result
+        if (mr == null) {
+            val fallback = s.bestFile
+            if (fallback != null && fallback.exists()) {
+                saveToGallery("Recamera_Lua_$stamp.jpg", "Pictures/Recamera") { out ->
+                    fallback.inputStream().use { it.copyTo(out) }
+                }
+                return "Lua não combinada ($why). Salvei o melhor quadro."
+            }
+            return "Lua não combinada ($why). Nenhum quadro com a Lua foi encontrado."
+        }
+        saveToGallery("Recamera_Lua_$stamp.jpg", "Pictures/Recamera") { it.write(mr.jpeg) }
+        saveToGallery("Recamera_Lua_${stamp}_quadro.jpg", "Pictures/Recamera/Originais") { out ->
+            mr.bestFrame.inputStream().use { it.copyTo(out) }
+        }
+        return "Lua combinada: ${mr.used} melhores quadros de ${mr.detected} com a Lua detectada (${mr.total} tirados). " +
+            "Quadro original em Fotos/Recamera/Originais." + runAi(stamp, mr.jpeg)
+    }
+
+    private fun processAndSave(files: List<File>, native: Boolean): String {
         val stamp = System.currentTimeMillis()
         val original = files.first()
+
+        if (native) { // foto única já processada pelo Samsung (HDR/Noite/Auto): não empilha
+            saveToGallery("Recamera_$stamp.jpg", "Pictures/Recamera") { out ->
+                original.inputStream().use { it.copyTo(out) }
+            }
+            return "Foto salva com o processamento do Samsung." + runAi(stamp, original.readBytes())
+        }
 
         var result: StackResult? = null
         var failure: String? = null
@@ -389,20 +530,21 @@ class MainActivity : ComponentActivity() {
         saveToGallery("Recamera_${stamp}_original.jpg", "Pictures/Recamera/Originais") { out ->
             original.inputStream().use { it.copyTo(out) }
         }
-        var aiNote = ""
-        if (ai.enabled) {
-            val key = ai.loadKey()
-            if (key == null) aiNote = " IA: chave não encontrada, abra ⚙ e informe de novo."
-            else try {
-                runOnUiThread { captureButton.text = "Enviando à IA…" }
-                val enhanced = GeminiClient.enhance(key, ai.model, res.jpeg, ai.imageSize)
-                saveToGallery("Recamera_${stamp}_IA.jpg", "Pictures/Recamera/IA") { it.write(enhanced) }
-                aiNote = " Versão IA em Fotos/Recamera/IA."
-            } catch (e: Throwable) {
-                aiNote = " IA não aplicada: ${e.message}."
-            }
+        return "Foto combinada com ${res.used} de ${res.total} quadros. Original em Fotos/Recamera/Originais." + runAi(stamp, res.jpeg)
+    }
+
+    /** Etapa opcional: envia a foto ao Gemini e salva a versão da IA à parte. Devolve uma nota para a mensagem final. */
+    private fun runAi(stamp: Long, source: ByteArray): String {
+        if (!ai.enabled) return ""
+        val key = ai.loadKey() ?: return " IA: chave não encontrada, abra ⚙ e informe de novo."
+        return try {
+            runOnUiThread { captureButton.text = "Enviando à IA…" }
+            val enhanced = GeminiClient.enhance(key, ai.model, source, ai.imageSize)
+            saveToGallery("Recamera_${stamp}_IA.jpg", "Pictures/Recamera/IA") { it.write(enhanced) }
+            " Versão IA em Fotos/Recamera/IA."
+        } catch (e: Throwable) {
+            " IA não aplicada: ${e.message}."
         }
-        return "Foto combinada com ${res.used} de ${res.total} quadros. Original em Fotos/Recamera/Originais.$aiNote"
     }
 
     private fun saveToGallery(name: String, relativePath: String, write: (OutputStream) -> Unit) {
@@ -463,6 +605,33 @@ class MainActivity : ComponentActivity() {
             sizeGroup.addView(RadioButton(this).apply { id = 1000 + i; text = label; isChecked = ai.imageSize == v })
         }
         col.addView(sizeGroup)
+        val nativeSw = Switch(this).apply {
+            text = "Usar processamento do Samsung (HDR/Noite) quando disponível"
+            isChecked = ai.nativeProcessing; setPadding(0, dp(12), 0, dp(4))
+        }
+        col.addView(nativeSw)
+        col.addView(TextView(this).apply {
+            textSize = 11f
+            text = "Recomendado: é o que mais se aproxima da câmera nativa. Nesse caso o app tira 1 foto já processada " +
+                "pelo celular. Desligado, o app usa o empilhamento próprio (6 a 8 fotos)."
+        })
+        col.addView(TextView(this).apply { text = "Quadros do modo Lua"; setPadding(0, dp(12), 0, 0) })
+        val moonOpts = listOf(20, 40, 60, 100, 200, 300)
+        val moonLabels = listOf(
+            "20 quadros (cerca de 30 s)", "40 quadros (cerca de 1 min)", "60 quadros (1 a 2 min)",
+            "100 quadros (2 a 3 min)", "200 quadros (4 a 7 min)", "300 quadros (5 a 10 min)"
+        )
+        val moonGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        moonOpts.forEachIndexed { i, n ->
+            moonGroup.addView(RadioButton(this).apply { id = 2000 + i; text = moonLabels[i]; isChecked = ai.moonFrames == n })
+        }
+        col.addView(moonGroup)
+        col.addView(TextView(this).apply {
+            textSize = 11f
+            text = "Mais quadros = menos ruído, mas a melhora diminui a cada vez que dobra. Cada quadro é processado na hora e " +
+                "o arquivo grande é apagado, então o armazenamento não enche. Com muitos quadros a Lua anda no céu: o app " +
+                "recentraliza sozinho, mas confira se ela não sai da tela. Use tripé. Dá para parar antes tocando no botão."
+        })
         val sw = Switch(this).apply {
             text = "Melhorar também com IA (online)"; isChecked = ai.enabled; setPadding(0, dp(12), 0, dp(4))
         }
@@ -497,7 +666,8 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton("Salvar") { _, _ ->
                 saveSettings(
                     keyField.text.toString().filter { !it.isWhitespace() }, modelField.text.toString().trim(),
-                    sizeOpts.getOrNull(sizeGroup.checkedRadioButtonId - 1000)?.first ?: "2K", sw.isChecked
+                    sizeOpts.getOrNull(sizeGroup.checkedRadioButtonId - 1000)?.first ?: "2K", sw.isChecked, nativeSw.isChecked,
+                    moonOpts.getOrNull(moonGroup.checkedRadioButtonId - 2000) ?: 40
                 )
             }
             .setNegativeButton("Cancelar", null)
@@ -507,7 +677,9 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    private fun saveSettings(key: String, model: String, size: String, enable: Boolean) {
+    private fun saveSettings(key: String, model: String, size: String, enable: Boolean, nativeOn: Boolean, moonN: Int) {
+        ai.moonFrames = moonN
+        if (nativeOn != ai.nativeProcessing) { ai.nativeProcessing = nativeOn; bindCamera() }
         if (key.isNotEmpty()) {
             if (!Regex("^[A-Za-z0-9_.-]{20,}$").matches(key)) { toast("A chave parece inválida. Confira e cole de novo.", long = true); return }
             ai.saveKey(key)
@@ -535,6 +707,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         executor.shutdown()
+        moonSession?.release()
         tempFiles.forEach { it.delete() }
     }
 }

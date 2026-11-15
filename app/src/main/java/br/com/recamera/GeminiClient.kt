@@ -2,9 +2,12 @@ package br.com.recamera
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import androidx.exifinterface.media.ExifInterface
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -95,8 +98,14 @@ object GeminiClient {
         BitmapFactory.decodeByteArray(src, 0, src.size, bounds)
         var sample = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= MAX_SIDE) sample *= 2
-        val bmp = BitmapFactory.decodeByteArray(src, 0, src.size, BitmapFactory.Options().apply { inSampleSize = sample })
+        val decoded = BitmapFactory.decodeByteArray(src, 0, src.size, BitmapFactory.Options().apply { inSampleSize = sample })
             ?: throw IOException("não foi possível ler a foto")
+        // Fotos do Samsung/CameraX trazem a rotação no EXIF; a IA precisa receber a foto em pé
+        val deg = try { ExifInterface(ByteArrayInputStream(src)).rotationDegrees } catch (e: Exception) { 0 }
+        val bmp = if (deg != 0) {
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, Matrix().apply { postRotate(deg.toFloat()) }, true)
+                .also { if (it !== decoded) decoded.recycle() }
+        } else decoded
         val longest = maxOf(bmp.width, bmp.height)
         val scaled = if (longest > MAX_SIDE) {
             val f = MAX_SIDE.toFloat() / longest
